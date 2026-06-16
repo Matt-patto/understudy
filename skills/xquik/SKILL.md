@@ -59,7 +59,7 @@ Search public posts:
 
 ```bash
 curl -fsS \
-  -H "Authorization: Bearer ${XQUIK_API_KEY}" \
+  -H "x-api-key: ${XQUIK_API_KEY}" \
   "$base/x/tweets/search?q=from%3AXDevelopers&limit=10"
 ```
 
@@ -67,7 +67,7 @@ Look up a user:
 
 ```bash
 curl -fsS \
-  -H "Authorization: Bearer ${XQUIK_API_KEY}" \
+  -H "x-api-key: ${XQUIK_API_KEY}" \
   "$base/x/users/XDevelopers"
 ```
 
@@ -75,7 +75,7 @@ Read a post by ID:
 
 ```bash
 curl -fsS \
-  -H "Authorization: Bearer ${XQUIK_API_KEY}" \
+  -H "x-api-key: ${XQUIK_API_KEY}" \
   "$base/x/tweets/1893456789012345678"
 ```
 
@@ -84,7 +84,7 @@ Download media from a public post:
 ```bash
 curl -fsS \
   -X POST \
-  -H "Authorization: Bearer ${XQUIK_API_KEY}" \
+  -H "x-api-key: ${XQUIK_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"tweetInput":"https://x.com/username/status/1893456789012345678"}' \
   "$base/x/media/download"
@@ -94,7 +94,7 @@ Check whether one user follows another:
 
 ```bash
 curl -fsS \
-  -H "Authorization: Bearer ${XQUIK_API_KEY}" \
+  -H "x-api-key: ${XQUIK_API_KEY}" \
   "$base/x/followers/check?source=XDevelopers&target=OpenAI"
 ```
 
@@ -116,7 +116,7 @@ Use the remote MCP server at:
 https://xquik.com/mcp
 ```
 
-Authenticate with a Bearer token from `XQUIK_API_KEY`. Use the MCP discovery or explore tool first when the user asks for an unfamiliar task, then execute the smallest matching API call.
+Authenticate with the `x-api-key` header from `XQUIK_API_KEY`. Use the MCP discovery or explore tool first when the user asks for an unfamiliar task, then execute the smallest matching API call.
 
 ## Response Handling
 
