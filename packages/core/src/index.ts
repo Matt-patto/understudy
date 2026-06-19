@@ -253,6 +253,53 @@ export {
 	PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER,
 	recoverContextAfterOverflowInPlace,
 } from "./runtime/tool-result-context-guard.js";
+export {
+	tokenCountFromLastApiResponse,
+	estimateContextTokens,
+	sumUsageTokens,
+} from "./runtime/token-usage.js";
+export {
+	applyToolBudget,
+	applyToolBudgetToMessagesInPlace,
+	DEFAULT_MAX_RESULT_SIZE_CHARS,
+	MAX_TOOL_RESULTS_PER_MESSAGE_CHARS,
+	PERSISTED_OUTPUT_PREVIEW_CHARS,
+} from "./runtime/tool-budget.js";
+export type {
+	ApplyToolBudgetOptions,
+	ApplyToolBudgetResult,
+	PersistedToolResultInfo,
+	PersistedToolResultWriter,
+} from "./runtime/tool-budget.js";
+export {
+	microcompactMessages,
+	microcompactMessagesInPlace,
+	MICROCOMPACT_CLEARED_PLACEHOLDER,
+	DEFAULT_MICROCOMPACT_KEEP_RECENT,
+	DEFAULT_MICROCOMPACT_GAP_THRESHOLD_MINUTES,
+} from "./runtime/microcompact.js";
+export type { MicrocompactOptions, MicrocompactResult } from "./runtime/microcompact.js";
+export {
+	runAutocompact,
+	evaluateAutocompact,
+	computeAutocompactThreshold,
+	rebuildHistoryWithSummary,
+	createAutocompactState,
+	isAutocompactDisabled,
+	resolveAutocompactContextWindow,
+	AUTOCOMPACT_BUFFER_TOKENS,
+	AUTOCOMPACT_RESERVED_SUMMARY_CAP_TOKENS,
+	AUTOCOMPACT_BOUNDARY_MARKER,
+	AUTOCOMPACT_SUMMARY_PROMPT,
+	MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES,
+	DEFAULT_AUTOCOMPACT_KEEP_RECENT_MESSAGES,
+} from "./runtime/autocompact.js";
+export type {
+	AutocompactState,
+	AutocompactDecision,
+	AutocompactRunResult,
+	SummarizeFn,
+} from "./runtime/autocompact.js";
 export type {
 	UnderstudySessionLifecycleHooks,
 	UnderstudySessionPromptBuiltEvent,

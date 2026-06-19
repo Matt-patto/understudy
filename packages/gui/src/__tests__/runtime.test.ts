@@ -333,8 +333,8 @@ describe("ComputerUseGuiRuntime", () => {
 			confidence: 1,
 		});
 		expect(result.image).toMatchObject({
-			mimeType: "image/png",
-			filename: "gui-screenshot.png",
+			mimeType: "image/jpeg",
+			filename: "gui-screenshot.jpg",
 		});
 		expect(mocks.execCalls.find((call) => call.file === "screencapture")?.args).toEqual([
 			"-x",
@@ -368,7 +368,17 @@ describe("ComputerUseGuiRuntime", () => {
 			"png",
 			"/tmp/understudy-gui-test/gui-screenshot.png",
 		]);
-		expect(mocks.execCalls.find((call) => call.file === "sips")).toBeUndefined();
+		expect(mocks.execCalls.find((call) => call.file === "sips")?.args).toEqual([
+			"-s",
+			"format",
+			"jpeg",
+			"-s",
+			"formatOptions",
+			"75",
+			"/tmp/understudy-gui-test/gui-screenshot.png",
+			"--out",
+			"/tmp/understudy-gui-test/gui-screenshot.jpg",
+		]);
 	});
 
 	it("captures the minimal union of visible app windows", async () => {
@@ -399,7 +409,17 @@ describe("ComputerUseGuiRuntime", () => {
 			"png",
 			"/tmp/understudy-gui-test/gui-screenshot.png",
 		]);
-		expect(mocks.execCalls.find((call) => call.file === "sips")).toBeUndefined();
+		expect(mocks.execCalls.find((call) => call.file === "sips")?.args).toEqual([
+			"-s",
+			"format",
+			"jpeg",
+			"-s",
+			"formatOptions",
+			"75",
+			"/tmp/understudy-gui-test/gui-screenshot.png",
+			"--out",
+			"/tmp/understudy-gui-test/gui-screenshot.jpg",
+		]);
 	});
 
 	it("tracks retina-scaled app regions without extra canvas cropping", async () => {
@@ -426,7 +446,17 @@ describe("ComputerUseGuiRuntime", () => {
 			capture_scale_y: 2,
 			window_capture_strategy: "app_union",
 		});
-		expect(mocks.execCalls.find((call) => call.file === "sips")).toBeUndefined();
+		expect(mocks.execCalls.find((call) => call.file === "sips")?.args).toEqual([
+			"-s",
+			"format",
+			"jpeg",
+			"-s",
+			"formatOptions",
+			"75",
+			"/tmp/understudy-gui-test/gui-screenshot.png",
+			"--out",
+			"/tmp/understudy-gui-test/gui-screenshot.jpg",
+		]);
 	});
 
 	it("uses explicit display capture when requested", async () => {
@@ -634,7 +664,7 @@ describe("ComputerUseGuiRuntime", () => {
 				window_title: "Composer",
 			},
 		});
-		expect(result.image?.mimeType).toBe("image/png");
+		expect(result.image?.mimeType).toBe("image/jpeg");
 	});
 
 	it("accepts display-space grounding points from custom providers without reprojecting them", async () => {
@@ -736,7 +766,7 @@ describe("ComputerUseGuiRuntime", () => {
 			grounding_resolution_error:
 				'Grounding resolved "Send button" to image-space point (1200, 100), but that point falls outside 800x600px.',
 		});
-		expect(result.image?.mimeType).toBe("image/png");
+		expect(result.image?.mimeType).toBe("image/jpeg");
 		expect(mocks.execCalls.find((call) =>
 			call.file === MOCK_NATIVE_HELPER_PATH &&
 			call.args[0] === "event" &&
@@ -2026,5 +2056,78 @@ describe("ComputerUseGuiRuntime", () => {
 		} finally {
 			dateNowSpy.mockRestore();
 		}
+	});
+
+	describe("gui_batch", () => {
+		it("grounds steps against one shared screenshot and executes sequentially", async () => {
+			const ground = vi.fn()
+				.mockResolvedValueOnce(groundedTarget("Save button", { x: 120, y: 90 }))
+				.mockResolvedValueOnce(groundedTarget("Cancel button", { x: 220, y: 90 }));
+			const runtime = createRuntime(ground);
+
+			const result = await runtime.batch({
+				app: "Mail",
+				steps: [
+					{ action: "click", target: "Save button" },
+					{ action: "click", target: "Cancel button" },
+					{ action: "key", key: "Enter" },
+				],
+			});
+
+			// Exactly one shared capture + one final evidence capture — grounding adds none.
+			expect(mocks.execCalls.filter((call) => call.file === "screencapture")).toHaveLength(2);
+			// Only the two click steps are grounded; the key step needs no grounding.
+			expect(ground).toHaveBeenCalledTimes(2);
+			const clickEvents = mocks.execCalls.filter(
+				(call) =>
+					call.file === MOCK_NATIVE_HELPER_PATH &&
+					call.args[0] === "event" &&
+					call.env.UNDERSTUDY_GUI_EVENT_MODE === "click",
+			);
+			expect(clickEvents).toHaveLength(2);
+			expect(result.status.code).toBe("action_sent");
+			expect(result.details?.batch).toBe(true);
+			expect(result.details?.executed_count).toBe(3);
+			expect((result.details?.steps as unknown[]).length).toBe(3);
+		});
+
+		it("skips a step whose grounding fails but continues the rest", async () => {
+			const ground = vi.fn()
+				.mockResolvedValueOnce(undefined)
+				.mockResolvedValueOnce(groundedTarget("Second", { x: 200, y: 120 }));
+			const runtime = createRuntime(ground);
+
+			const result = await runtime.batch({
+				app: "Mail",
+				steps: [
+					{ action: "click", target: "Missing" },
+					{ action: "click", target: "Second" },
+				],
+			});
+
+			const clickEvents = mocks.execCalls.filter(
+				(call) =>
+					call.file === MOCK_NATIVE_HELPER_PATH &&
+					call.args[0] === "event" &&
+					call.env.UNDERSTUDY_GUI_EVENT_MODE === "click",
+			);
+			expect(clickEvents).toHaveLength(1);
+			expect(result.details?.executed_count).toBe(1);
+			const steps = result.details?.steps as Array<{ status: string }>;
+			expect(steps[0].status).toBe("not_found");
+			expect(steps[1].status).toBe("action_sent");
+		});
+
+		it("rejects more than the maximum number of steps", async () => {
+			const ground = vi.fn();
+			const runtime = createRuntime(ground);
+			const steps = Array.from({ length: 11 }, () => ({ action: "click" as const, target: "x" }));
+
+			const result = await runtime.batch({ steps });
+
+			expect(result.status.code).toBe("unsupported");
+			expect(mocks.execCalls.filter((call) => call.file === "screencapture")).toHaveLength(0);
+			expect(ground).not.toHaveBeenCalled();
+		});
 	});
 });

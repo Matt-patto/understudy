@@ -1,3 +1,4 @@
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,6 +7,278 @@ import { execFileAsync } from "./exec-utils.js";
 
 const HELPER_BINARY_NAME = "understudy-gui-native-helper";
 const HELPER_COMPILE_TIMEOUT_MS = 120_000;
+const SERVE_SENTINEL = "__UNDERSTUDY_SERVE_DONE__";
+
+/**
+ * Whether to route native helper calls through a persistent serve-mode process
+ * instead of spawning one process per action. Default on; any error or timeout
+ * falls back to the one-shot path so this can only speed things up, never break
+ * them. Disable with UNDERSTUDY_GUI_HELPER_SERVE=0.
+ */
+export function nativeHelperServeEnabled(): boolean {
+	const raw = process.env.UNDERSTUDY_GUI_HELPER_SERVE;
+	if (raw === undefined) {
+		return true;
+	}
+	const normalized = raw.trim().toLowerCase();
+	return !(
+		normalized === "0"
+		|| normalized === "false"
+		|| normalized === "off"
+		|| normalized === "no"
+	);
+}
+
+/**
+ * Persistent native-helper process speaking a newline-delimited JSON request /
+ * sentinel-framed response protocol. Requests are serialized through a mutex.
+ * Any failure kills the child (a fresh one spawns on the next request) and the
+ * error propagates so the caller can fall back to a one-shot invocation.
+ */
+class NativeHelperServeProcess {
+	private child: ChildProcess | undefined;
+	private alive = false;
+	private stdoutBuffer = "";
+	private pendingLines: string[] = [];
+	private lineWaiters: Array<(line: string) => void> = [];
+	private mutex: Promise<void> = Promise.resolve();
+
+	private ensureChild(binaryPath: string): ChildProcess {
+		if (this.child && this.alive) {
+			return this.child;
+		}
+		const child = spawn(binaryPath, ["serve"], {
+			env: process.env,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		this.child = child;
+		this.alive = true;
+		this.stdoutBuffer = "";
+		this.pendingLines = [];
+		this.lineWaiters = [];
+		child.stdout?.setEncoding("utf-8");
+		child.stdout?.on("data", (chunk: string) => this.onStdout(chunk));
+		const markDead = () => {
+			this.alive = false;
+		};
+		child.on("exit", markDead);
+		child.on("error", markDead);
+		child.stdin?.on("error", markDead);
+		return child;
+	}
+
+	private onStdout(chunk: string): void {
+		this.stdoutBuffer += chunk;
+		let newlineIndex = this.stdoutBuffer.indexOf("\n");
+		while (newlineIndex >= 0) {
+			const line = this.stdoutBuffer.slice(0, newlineIndex);
+			this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1);
+			const waiter = this.lineWaiters.shift();
+			if (waiter) {
+				waiter(line);
+			} else {
+				this.pendingLines.push(line);
+			}
+			newlineIndex = this.stdoutBuffer.indexOf("\n");
+		}
+	}
+
+	private nextLine(): Promise<string> {
+		const pending = this.pendingLines.shift();
+		if (pending !== undefined) {
+			return Promise.resolve(pending);
+		}
+		return new Promise<string>((resolve) => this.lineWaiters.push(resolve));
+	}
+
+	private kill(): void {
+		this.alive = false;
+		try {
+			this.child?.kill("SIGKILL");
+		} catch {
+			// ignore
+		}
+		this.child = undefined;
+		this.pendingLines = [];
+		this.lineWaiters = [];
+		this.stdoutBuffer = "";
+	}
+
+	async request(
+		binaryPath: string,
+		command: string,
+		env: Record<string, string | undefined>,
+		timeoutMs: number,
+	): Promise<string> {
+		let release!: () => void;
+		const previous = this.mutex;
+		this.mutex = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		try {
+			return await this.requestLocked(binaryPath, command, env, timeoutMs);
+		} catch (error) {
+			// Any failure poisons the framing; drop the child so the next request
+			// starts clean, and let the caller fall back to a one-shot invocation.
+			this.kill();
+			throw error;
+		} finally {
+			release();
+		}
+	}
+
+	private async requestLocked(
+		binaryPath: string,
+		command: string,
+		env: Record<string, string | undefined>,
+		timeoutMs: number,
+	): Promise<string> {
+		const child = this.ensureChild(binaryPath);
+		this.pendingLines = [];
+		const cleanEnv: Record<string, string> = {};
+		for (const [key, value] of Object.entries(env)) {
+			if (typeof value === "string") {
+				cleanEnv[key] = value;
+			}
+		}
+		if (!child.stdin?.writable) {
+			throw new Error("native helper serve stdin is not writable");
+		}
+		child.stdin.write(`${JSON.stringify({ command, env: cleanEnv })}\n`);
+		const lines: string[] = [];
+		const deadline = Date.now() + timeoutMs;
+		for (;;) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) {
+				throw new Error("native helper serve request timed out");
+			}
+			const line = await this.withTimeout(this.nextLine(), remaining);
+			if (line.startsWith(SERVE_SENTINEL)) {
+				const status = line.slice(SERVE_SENTINEL.length).trim();
+				if (status.startsWith("ok")) {
+					return lines.join("\n").trim();
+				}
+				throw new Error(`native helper serve command failed: ${status.replace(/^err\s*/, "")}`);
+			}
+			lines.push(line);
+		}
+	}
+
+	private withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+		return new Promise<T>((resolve, reject) => {
+			const timer = setTimeout(() => reject(new Error("native helper serve read timed out")), ms);
+			promise.then(
+				(value) => {
+					clearTimeout(timer);
+					resolve(value);
+				},
+				(error) => {
+					clearTimeout(timer);
+					reject(error);
+				},
+			);
+		});
+	}
+}
+
+const serveProcess = new NativeHelperServeProcess();
+
+/** Run a native helper command via the persistent serve-mode process. */
+export async function runNativeHelperViaServe(
+	binaryPath: string,
+	command: string,
+	env: Record<string, string | undefined>,
+	timeoutMs: number,
+): Promise<string> {
+	return serveProcess.request(binaryPath, command, env, timeoutMs);
+}
+
+/**
+ * Whether the user-driven emergency stop (press Escape to abort in-flight GUI
+ * actions) is enabled. Opt-in: it relies on a global key event tap that cannot
+ * be verified headlessly, so it stays off unless explicitly enabled to avoid
+ * spuriously aborting verified default flows.
+ */
+export function emergencyStopEnabled(): boolean {
+	const raw = process.env.UNDERSTUDY_GUI_EMERGENCY_STOP;
+	if (raw === undefined) {
+		return false;
+	}
+	const normalized = raw.trim().toLowerCase();
+	return normalized === "1" || normalized === "true" || normalized === "on" || normalized === "yes";
+}
+
+/**
+ * Spawns the native `watch-escape` helper once and exposes an AbortSignal that
+ * fires when the user presses Escape, so GUI actions can be interrupted.
+ */
+class EmergencyStopMonitor {
+	private child: ChildProcess | undefined;
+	private controller: AbortController | undefined;
+	private starting: Promise<void> | undefined;
+
+	get signal(): AbortSignal | undefined {
+		return this.controller?.signal;
+	}
+
+	async ensureStarted(binaryPath: string): Promise<void> {
+		if (this.controller) {
+			return;
+		}
+		if (this.starting) {
+			return this.starting;
+		}
+		this.starting = (async () => {
+			const controller = new AbortController();
+			this.controller = controller;
+			try {
+				const child = spawn(binaryPath, ["watch-escape"], {
+					env: process.env,
+					stdio: ["ignore", "pipe", "ignore"],
+				});
+				this.child = child;
+				child.stdout?.setEncoding("utf-8");
+				child.stdout?.on("data", (chunk: string) => {
+					if (chunk.includes("escape")) {
+						this.trigger();
+					}
+				});
+				child.on("error", () => {});
+			} catch {
+				// Monitor unavailable; the signal simply never fires.
+			}
+		})();
+		return this.starting;
+	}
+
+	private trigger(): void {
+		try {
+			this.controller?.abort(new Error("Emergency stop: Escape pressed."));
+		} catch {
+			// ignore
+		}
+	}
+}
+
+const emergencyStopMonitor = new EmergencyStopMonitor();
+
+/**
+ * Returns an AbortSignal that aborts when the user presses Escape, or undefined
+ * when the emergency stop is disabled or unavailable.
+ */
+export async function getEmergencyStopSignal(): Promise<AbortSignal | undefined> {
+	if (!emergencyStopEnabled()) {
+		return undefined;
+	}
+	try {
+		const binaryPath = await resolveNativeGuiHelperBinary();
+		await emergencyStopMonitor.ensureStarted(binaryPath);
+		return emergencyStopMonitor.signal;
+	} catch {
+		return undefined;
+	}
+}
 
 const NATIVE_GUI_HELPER_SOURCE = String.raw`
 import Foundation
@@ -82,8 +355,18 @@ struct WindowSelection {
 	let captureStrategy: String
 }
 
+struct ServeRequest: Codable {
+	let command: String
+	let env: [String: String]?
+}
+
+var requestEnvOverride: [String: String]? = nil
+
 func env(_ key: String) -> String {
-	ProcessInfo.processInfo.environment[key] ?? ""
+	if let override = requestEnvOverride, let value = override[key] {
+		return value
+	}
+	return ProcessInfo.processInfo.environment[key] ?? ""
 }
 
 func trimmedEnv(_ key: String) -> String? {
@@ -716,8 +999,94 @@ func handleEvent() throws {
 	}
 }
 
-do {
-	let command = CommandLine.arguments.dropFirst().first ?? ""
+func redactHostWindows() throws {
+	guard let inputPath = trimmedEnv("UNDERSTUDY_GUI_REDACT_INPUT"),
+		let outputPath = trimmedEnv("UNDERSTUDY_GUI_REDACT_OUTPUT") else {
+		throw HelperError.missingEnv("UNDERSTUDY_GUI_REDACT_INPUT/UNDERSTUDY_GUI_REDACT_OUTPUT")
+	}
+	let owners = env("UNDERSTUDY_GUI_REDACT_OWNERS")
+		.split(separator: ",")
+		.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+		.filter { !$0.isEmpty }
+	let originX = (try? requiredDouble("UNDERSTUDY_GUI_CAPTURE_ORIGIN_X")) ?? 0
+	let originY = (try? requiredDouble("UNDERSTUDY_GUI_CAPTURE_ORIGIN_Y")) ?? 0
+	let captureWidth = (try? requiredDouble("UNDERSTUDY_GUI_CAPTURE_WIDTH")) ?? 0
+	let captureHeight = (try? requiredDouble("UNDERSTUDY_GUI_CAPTURE_HEIGHT")) ?? 0
+
+	guard let image = NSImage(contentsOfFile: inputPath),
+		let tiff = image.tiffRepresentation,
+		let rep = NSBitmapImageRep(data: tiff) else {
+		throw HelperError.invalidCommand("redact: cannot read input image")
+	}
+	let pixelWidth = rep.pixelsWide
+	let pixelHeight = rep.pixelsHigh
+	let scaleX = captureWidth > 0 ? Double(pixelWidth) / captureWidth : 1
+	let scaleY = captureHeight > 0 ? Double(pixelHeight) / captureHeight : 1
+	let captureRect = CGRect(x: originX, y: originY, width: captureWidth, height: captureHeight)
+
+	var rects: [NSRect] = []
+	if !owners.isEmpty, captureWidth > 0, captureHeight > 0,
+		let windowInfo = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+		for info in windowInfo {
+			let owner = (info[kCGWindowOwnerName as String] as? String ?? "").lowercased()
+			guard owners.contains(owner) else { continue }
+			guard let rawBounds = info[kCGWindowBounds as String],
+				let bounds = CGRect(dictionaryRepresentation: rawBounds as! CFDictionary) else { continue }
+			let inter = bounds.intersection(captureRect)
+			if inter.isNull || inter.width <= 0 || inter.height <= 0 { continue }
+			let left = (inter.minX - originX) * scaleX
+			let topFromTop = (inter.minY - originY) * scaleY
+			let width = inter.width * scaleX
+			let height = inter.height * scaleY
+			// NSBitmapImageRep drawing uses a bottom-left origin; flip Y.
+			let bottom = Double(pixelHeight) - (topFromTop + height)
+			rects.append(NSRect(x: left, y: bottom, width: width, height: height))
+		}
+	}
+
+	if !rects.isEmpty, let ctx = NSGraphicsContext(bitmapImageRep: rep) {
+		NSGraphicsContext.saveGraphicsState()
+		NSGraphicsContext.current = ctx
+		NSColor(calibratedWhite: 0.97, alpha: 1).setFill()
+		for rect in rects {
+			NSBezierPath(rect: rect).fill()
+		}
+		ctx.flushGraphics()
+		NSGraphicsContext.restoreGraphicsState()
+	}
+
+	guard let png = rep.representation(using: .png, properties: [:]) else {
+		throw HelperError.invalidCommand("redact: cannot encode output png")
+	}
+	try png.write(to: URL(fileURLWithPath: outputPath))
+	print("redacted \(rects.count)")
+}
+
+func watchEscape() throws {
+	let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+	guard let tap = CGEvent.tapCreate(
+		tap: .cgSessionEventTap,
+		place: .headInsertEventTap,
+		options: .listenOnly,
+		eventsOfInterest: mask,
+		callback: { _, _, event, _ in
+			if event.getIntegerValueField(.keyboardEventKeycode) == 53 {
+				FileHandle.standardOutput.write(Data("escape\n".utf8))
+				exit(0)
+			}
+			return Unmanaged.passUnretained(event)
+		},
+		userInfo: nil,
+	) else {
+		throw HelperError.invalidCommand("watch-escape: cannot create event tap (needs Accessibility)")
+	}
+	let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+	CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+	CGEvent.tapEnable(tap: tap, enable: true)
+	CFRunLoopRun()
+}
+
+func runHelperCommand(_ command: String) throws {
 	switch command {
 	case "activate":
 		try activateApplication(named: trimmedEnv("UNDERSTUDY_GUI_APP"))
@@ -726,8 +1095,42 @@ do {
 		try handleCaptureContext()
 	case "event":
 		try handleEvent()
+	case "redact":
+		try redactHostWindows()
+	case "watch-escape":
+		try watchEscape()
 	default:
 		throw HelperError.invalidCommand(command)
+	}
+}
+
+do {
+	let command = CommandLine.arguments.dropFirst().first ?? ""
+	if command == "serve" {
+		// Persistent serve mode: read one JSON request per line ({command, env}),
+		// run it with that request's env, and terminate each response with a
+		// sentinel line so the caller can frame the output without capturing fds.
+		FileHandle.standardError.write(Data("understudy-gui-native-helper serve ready\n".utf8))
+		while let line = readLine(strippingNewline: true) {
+			if line.isEmpty { continue }
+			guard let data = line.data(using: .utf8),
+				let request = try? JSONDecoder().decode(ServeRequest.self, from: data) else {
+				print("__UNDERSTUDY_SERVE_DONE__ err invalid serve request")
+				fflush(stdout)
+				continue
+			}
+			requestEnvOverride = request.env ?? [:]
+			do {
+				try runHelperCommand(request.command)
+				print("__UNDERSTUDY_SERVE_DONE__ ok")
+			} catch {
+				print("__UNDERSTUDY_SERVE_DONE__ err \(error)")
+			}
+			requestEnvOverride = nil
+			fflush(stdout)
+		}
+	} else {
+		try runHelperCommand(command)
 	}
 } catch {
 	fputs("Understudy native GUI helper failed: \(error)\n", stderr)

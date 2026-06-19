@@ -10,6 +10,14 @@ import {
 	invalidateMessageCharsCacheEntry,
 	isToolResultMessage,
 } from "./tool-result-char-estimator.js";
+import {
+	applyToolBudgetToMessagesInPlace,
+	type PersistedToolResultWriter,
+} from "./tool-budget.js";
+import {
+	microcompactMessagesInPlace,
+	type MicrocompactOptions,
+} from "./microcompact.js";
 
 // Keep a conservative input budget to absorb tokenizer variance and provider framing overhead.
 const CONTEXT_INPUT_HEADROOM_RATIO = 0.75;
@@ -402,6 +410,15 @@ export function recoverContextAfterOverflowInPlace(params: {
 export function installToolResultContextGuard(params: {
 	agent: GuardableAgent;
 	contextWindowTokens: number;
+	/** Directory under which oversized tool outputs are persisted (defaults to cwd). */
+	persistDir?: string;
+	/** Injectable writer for persisted tool overflow (tests); bypasses disk. */
+	persistedToolResultWriter?: PersistedToolResultWriter;
+	/** Microcompact tuning (keepRecent, gapThresholdMinutes, allowlist). */
+	microcompact?: Pick<
+		MicrocompactOptions,
+		"keepRecent" | "gapThresholdMinutes" | "compactableToolNames"
+	>;
 }): () => void {
 	const contextWindowTokens = Math.max(1, Math.floor(params.contextWindowTokens));
 	const contextBudgetChars = Math.max(
@@ -431,6 +448,23 @@ export function installToolResultContextGuard(params: {
 			: messages;
 
 		const contextMessages = Array.isArray(transformed) ? transformed : messages;
+
+		// 1) Persist any single oversized tool result to disk and replace with a
+		//    preview, then reduce remaining tool results largest-first to honor
+		//    the per-message aggregate cap. Runs before char-budget compaction so
+		//    huge single outputs never blow the budget.
+		applyToolBudgetToMessagesInPlace({
+			messages: contextMessages,
+			persistDir: params.persistDir,
+			writer: params.persistedToolResultWriter,
+		});
+
+		// 2) Microcompact: model-free clearing of older tool-result content,
+		//    keeping the most recent N intact. Lighter than the heavy budget
+		//    compaction below and gated by UNDERSTUDY_CONTEXT_MICROCOMPACT.
+		microcompactMessagesInPlace(contextMessages, params.microcompact);
+
+		// 3) Existing reactive char-budget enforcement (truncate, compact, prune).
 		enforceToolResultContextBudgetInPlace({
 			messages: contextMessages,
 			contextBudgetChars,

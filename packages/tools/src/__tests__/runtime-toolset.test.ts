@@ -63,6 +63,7 @@ describe("createRuntimeToolset", () => {
 			"gui_key",
 			"gui_wait",
 			"gui_move",
+			"gui_batch",
 			"memory_search",
 			"memory_get",
 			"memory_manage",
@@ -222,7 +223,7 @@ describe("createRuntimeToolset", () => {
 		expect(catalog.summary.total).toBe(catalog.tools.length);
 		expect(catalog.summary.byCategory).toContainEqual({
 			id: "gui",
-			count: 8,
+			count: 9,
 		});
 		expect(catalog.summary.byCategory).toContainEqual({
 			id: "system",

@@ -300,6 +300,7 @@ describe("gui tool wrappers", () => {
 			expect.objectContaining({ name: "gui_key", label: "GUI Key" }),
 			expect.objectContaining({ name: "gui_wait", label: "GUI Wait" }),
 			expect.objectContaining({ name: "gui_move", label: "GUI Move" }),
+			expect.objectContaining({ name: "gui_batch", label: "GUI Batch" }),
 		]);
 	});
 

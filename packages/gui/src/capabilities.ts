@@ -9,7 +9,8 @@ export type GuiToolName =
 	| "gui_type"
 	| "gui_key"
 	| "gui_wait"
-	| "gui_move";
+	| "gui_move"
+	| "gui_batch";
 
 export interface GuiToolCapability {
 	enabled: boolean;
@@ -37,6 +38,7 @@ const GUI_TOOL_NAMES: GuiToolName[] = [
 	"gui_key",
 	"gui_wait",
 	"gui_move",
+	"gui_batch",
 ];
 
 const GUI_TOOLS_ALWAYS_AVAILABLE: GuiToolName[] = [
@@ -54,6 +56,7 @@ const GUI_TOOLS_REQUIRING_GROUNDING: GuiToolName[] = [
 	"gui_click",
 	"gui_drag",
 	"gui_wait",
+	"gui_batch",
 ];
 
 const GUI_TOOLS_REQUIRING_INPUT: GuiToolName[] = [
@@ -63,6 +66,7 @@ const GUI_TOOLS_REQUIRING_INPUT: GuiToolName[] = [
 	"gui_type",
 	"gui_key",
 	"gui_move",
+	"gui_batch",
 ];
 
 const GUI_TOOLS_REQUIRING_SCREEN_CAPTURE: GuiToolName[] = [
@@ -70,6 +74,7 @@ const GUI_TOOLS_REQUIRING_SCREEN_CAPTURE: GuiToolName[] = [
 	"gui_click",
 	"gui_drag",
 	"gui_wait",
+	"gui_batch",
 ];
 
 const GUI_GROUNDING_REQUIRED_REASON =

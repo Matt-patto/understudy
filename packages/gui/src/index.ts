@@ -26,6 +26,9 @@ export {
 export type {
 	GuiActionResult,
 	GuiActionStatus,
+	GuiBatchAction,
+	GuiBatchParams,
+	GuiBatchStep,
 	GuiObservation,
 	GuiResolution,
 	GuiCaptureMode,
@@ -57,3 +60,5 @@ export type {
 	GuiEnvironmentReadinessCheck,
 	GuiEnvironmentReadinessSnapshot,
 } from "./readiness.js";
+export { emergencyStopEnabled, getEmergencyStopSignal } from "./native-helper.js";
+export { acquireGuiPhysicalLock, guiPhysicalLockEnabled } from "./physical-resource-lock.js";
