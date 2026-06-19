@@ -3,7 +3,11 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileAsync } from "./exec-utils.js";
-import { resolveNativeGuiHelperBinary } from "./native-helper.js";
+import {
+	nativeHelperServeEnabled,
+	resolveNativeGuiHelperBinary,
+	runNativeHelperViaServe,
+} from "./native-helper.js";
 import { normalizeGuiGroundingMode } from "./types.js";
 import {
 	resolveGuiRuntimeCapabilities,
@@ -12,6 +16,8 @@ import {
 import type { GuiEnvironmentReadinessSnapshot } from "./readiness.js";
 import type {
 	GuiActionResult,
+	GuiBatchParams,
+	GuiBatchStep,
 	GuiCaptureMode,
 	GuiClickParams,
 	GuiGroundingActionIntent,
@@ -46,6 +52,8 @@ const DEFAULT_NATIVE_TYPE_CLEAR_REPEAT = 48;
 const DEFAULT_SYSTEM_EVENTS_PASTE_PRE_DELAY_MS = 220;
 const DEFAULT_SYSTEM_EVENTS_PASTE_POST_DELAY_MS = 650;
 const DEFAULT_SYSTEM_EVENTS_KEYSTROKE_CHAR_DELAY_MS = 55;
+const SCREENSHOT_JPEG_QUALITY = 75;
+const GUI_BATCH_MAX_STEPS = 10;
 const DEFAULT_TARGETED_SCROLL_DISTANCE: GuiScrollDistance = "medium";
 const DEFAULT_TARGETLESS_SCROLL_DISTANCE: GuiScrollDistance = "page";
 const SCROLL_DISTANCE_AMOUNTS: Record<GuiScrollDistance, number> = {
@@ -153,6 +161,17 @@ function resolveClickActionIntent(params: GuiClickParams): PointActionIntent {
 	if (params.clicks === 2) return "double_click";
 	if (params.button === "none") return "hover";
 	if (params.holdMs) return "click_and_hold";
+	return "click";
+}
+
+function batchClickIntent(step: GuiBatchStep): PointActionIntent {
+	if (step.action === "right_click") return "right_click";
+	if (step.action === "double_click") return "double_click";
+	if (step.action === "hover") return "hover";
+	if (step.button === "right") return "right_click";
+	if (step.clicks === 2) return "double_click";
+	if (step.button === "none") return "hover";
+	if (step.holdMs) return "click_and_hold";
 	return "click";
 }
 
@@ -853,7 +872,7 @@ async function runAppleScript(
 }
 
 async function runNativeHelper(params: {
-	command: "capture-context" | "event";
+	command: "capture-context" | "event" | "redact";
 	env: Record<string, string | undefined>;
 	timeoutMs?: number;
 	failureMessage: string;
@@ -861,12 +880,22 @@ async function runNativeHelper(params: {
 }): Promise<string> {
 	try {
 		const binaryPath = await resolveNativeGuiHelperBinary();
+		const timeoutMs = params.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+		// Fast path: reuse a persistent serve-mode process. Any failure falls
+		// through to the one-shot invocation below, so serve can only speed up.
+		if (nativeHelperServeEnabled()) {
+			try {
+				return await runNativeHelperViaServe(binaryPath, params.command, params.env, timeoutMs);
+			} catch {
+				// fall back to one-shot
+			}
+		}
 		const result = await execFileAsync(binaryPath, [params.command], {
 			env: {
 				...process.env,
 				...params.env,
 			},
-			timeout: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+			timeout: timeoutMs,
 			maxBuffer: 8 * 1024 * 1024,
 			encoding: "utf-8",
 		});
@@ -1632,8 +1661,8 @@ async function captureScreenshotArtifact(params: {
 			timeout: DEFAULT_TIMEOUT_MS,
 			maxBuffer: 8 * 1024 * 1024,
 		});
-		let bytes: Buffer = Buffer.from(await readFile(filePath));
-		let imageSize = parsePngDimensions(bytes);
+		const bytes: Buffer = Buffer.from(await readFile(filePath));
+		const imageSize = parsePngDimensions(bytes);
 		const captureRect = normalizeRect(capture.captureRect);
 		const scaleX = imageSize?.width && captureRect.width > 0
 			? imageSize.width / captureRect.width
@@ -1641,11 +1670,17 @@ async function captureScreenshotArtifact(params: {
 		const scaleY = imageSize?.height && captureRect.height > 0
 			? imageSize.height / captureRect.height
 			: 1;
+		const redactedPath = await maybeRedactForModel({ pngPath: filePath, tempDir, captureRect });
+		const modelImage = await encodeScreenshotForModel({
+			pngPath: redactedPath ?? filePath,
+			pngBytes: bytes,
+			tempDir,
+		});
 		return {
-			bytes,
+			bytes: modelImage.bytes,
 			filePath,
-			mimeType: "image/png",
-			filename: "gui-screenshot.png",
+			mimeType: modelImage.mimeType,
+			filename: modelImage.filename,
 			metadata: {
 				mode: capture.mode,
 				captureRect,
@@ -1681,6 +1716,146 @@ async function captureScreenshotArtifact(params: {
 		throw new GuiRuntimeError(
 			`macOS screenshot capture failed. Ensure Screen Recording permissions are granted. ${message}`.trim(),
 		);
+	}
+}
+
+function redactSelfEnabled(): boolean {
+	// Opt-in: redaction is unverified on real GUI hardware, and it modifies the
+	// model-facing screenshot. Enable with UNDERSTUDY_GUI_REDACT_SELF=1 once
+	// validated against your host terminal/IDE.
+	const raw = process.env.UNDERSTUDY_GUI_REDACT_SELF;
+	if (raw === undefined) {
+		return false;
+	}
+	const normalized = raw.trim().toLowerCase();
+	return normalized === "1" || normalized === "true" || normalized === "on" || normalized === "yes";
+}
+
+/**
+ * Owner (application) names whose windows should be grayed out of the
+ * model-facing screenshot — typically the terminal/IDE hosting Understudy.
+ * Set UNDERSTUDY_GUI_SELF_OWNER_NAMES explicitly, otherwise derive from
+ * TERM_PROGRAM. Returns [] when the host can't be confidently identified, in
+ * which case redaction is a no-op.
+ */
+function resolveSelfOwnerNames(): string[] {
+	const explicit = process.env.UNDERSTUDY_GUI_SELF_OWNER_NAMES;
+	if (explicit && explicit.trim().length > 0) {
+		return explicit.split(",").map((value) => value.trim()).filter(Boolean);
+	}
+	const termProgram = (process.env.TERM_PROGRAM ?? "").trim().toLowerCase();
+	const map: Record<string, string[]> = {
+		apple_terminal: ["Terminal"],
+		"iterm.app": ["iTerm2"],
+		vscode: ["Code", "Visual Studio Code"],
+		hyper: ["Hyper"],
+		warpterminal: ["Warp"],
+		wezterm: ["WezTerm"],
+		ghostty: ["Ghostty"],
+		tabby: ["Tabby"],
+		kitty: ["kitty"],
+		alacritty: ["Alacritty"],
+	};
+	return map[termProgram] ?? [];
+}
+
+/**
+ * Produce a redacted copy of the screenshot (host terminal/IDE windows grayed
+ * out) for the MODEL-facing image only. The original PNG at {@link params.pngPath}
+ * is left untouched so grounding still works on pristine pixels. Returns the
+ * redacted path, or undefined to fall back to the original.
+ */
+async function maybeRedactForModel(params: {
+	pngPath: string;
+	tempDir: string;
+	captureRect: GuiRect;
+}): Promise<string | undefined> {
+	if (!redactSelfEnabled()) {
+		return undefined;
+	}
+	const owners = resolveSelfOwnerNames();
+	if (owners.length === 0) {
+		return undefined;
+	}
+	try {
+		const outputPath = join(params.tempDir, "gui-screenshot-redacted.png");
+		await runNativeHelper({
+			command: "redact",
+			env: {
+				UNDERSTUDY_GUI_REDACT_INPUT: params.pngPath,
+				UNDERSTUDY_GUI_REDACT_OUTPUT: outputPath,
+				UNDERSTUDY_GUI_REDACT_OWNERS: owners.join(","),
+				UNDERSTUDY_GUI_CAPTURE_ORIGIN_X: String(params.captureRect.x),
+				UNDERSTUDY_GUI_CAPTURE_ORIGIN_Y: String(params.captureRect.y),
+				UNDERSTUDY_GUI_CAPTURE_WIDTH: String(params.captureRect.width),
+				UNDERSTUDY_GUI_CAPTURE_HEIGHT: String(params.captureRect.height),
+			},
+			failureMessage: "GUI screenshot redaction failed.",
+			timeoutHint: "The GUI helper timed out while redacting the screenshot.",
+		});
+		return outputPath;
+	} catch {
+		return undefined;
+	}
+}
+
+function screenshotJpegEnabled(): boolean {
+	const raw = process.env.UNDERSTUDY_GUI_SCREENSHOT_JPEG;
+	if (raw === undefined) {
+		return true;
+	}
+	const normalized = raw.trim().toLowerCase();
+	return !(
+		normalized === "0"
+		|| normalized === "false"
+		|| normalized === "off"
+		|| normalized === "no"
+	);
+}
+
+/**
+ * Re-encode the model-facing screenshot as JPEG to cut token/payload cost
+ * (3-5x smaller than PNG). The PNG file at {@link params.pngPath} is kept
+ * untouched for grounding, which needs lossless pixels. Falls back to PNG on
+ * any failure or when disabled via UNDERSTUDY_GUI_SCREENSHOT_JPEG.
+ */
+async function encodeScreenshotForModel(params: {
+	pngPath: string;
+	pngBytes: Buffer;
+	tempDir: string;
+}): Promise<{ bytes: Buffer; mimeType: string; filename: string }> {
+	const png = {
+		bytes: params.pngBytes,
+		mimeType: "image/png",
+		filename: "gui-screenshot.png",
+	};
+	if (!screenshotJpegEnabled()) {
+		return png;
+	}
+	try {
+		const jpegPath = join(params.tempDir, "gui-screenshot.jpg");
+		await execFileAsync(
+			"sips",
+			[
+				"-s",
+				"format",
+				"jpeg",
+				"-s",
+				"formatOptions",
+				String(SCREENSHOT_JPEG_QUALITY),
+				params.pngPath,
+				"--out",
+				jpegPath,
+			],
+			{ timeout: DEFAULT_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 },
+		);
+		const jpegBytes = Buffer.from(await readFile(jpegPath));
+		if (jpegBytes.length === 0) {
+			return png;
+		}
+		return { bytes: jpegBytes, mimeType: "image/jpeg", filename: "gui-screenshot.jpg" };
+	} catch {
+		return png;
 	}
 }
 
@@ -2738,6 +2913,298 @@ export class ComputerUseGuiRuntime {
 					app: appName,
 			},
 			image: probe.image,
+		});
+	}
+
+	private batchStepNeedsGrounding(step: GuiBatchStep): boolean {
+		switch (step.action) {
+			case "click":
+			case "right_click":
+			case "double_click":
+			case "hover":
+				return true;
+			case "scroll":
+			case "type":
+				return Boolean(step.target?.trim());
+			default:
+				return false;
+		}
+	}
+
+	private async groundBatchStep(
+		step: GuiBatchStep,
+		artifact: GuiScreenshotArtifact,
+		appName?: string,
+	): Promise<GroundedGuiTarget | undefined> {
+		if (!this.batchStepNeedsGrounding(step)) {
+			return undefined;
+		}
+		const target = step.target?.trim();
+		if (!target) {
+			return undefined;
+		}
+		return await this.resolveGuiTarget({
+			artifact,
+			target,
+			scope: step.scope,
+			app: appName,
+			action: step.action as GuiGroundingActionIntent,
+			groundingMode: step.groundingMode,
+			locationHint: step.locationHint,
+		});
+	}
+
+	private async performBatchPointAction(
+		step: GuiBatchStep,
+		point: GuiPoint,
+		appName?: string,
+	): Promise<GuiNativeActionResult> {
+		switch (batchClickIntent(step)) {
+			case "right_click":
+				return performRightClick(appName, point, { activateApp: false });
+			case "double_click":
+				return performDoubleClick(appName, point, { activateApp: false });
+			case "hover":
+				return performHover(appName, point, Math.max(0, Math.round(step.settleMs ?? DEFAULT_HOVER_SETTLE_MS)), {
+					activateApp: false,
+				});
+			case "click_and_hold":
+				return performClickAndHold(
+					appName,
+					point,
+					Math.max(100, Math.round(step.holdMs ?? DEFAULT_CLICK_AND_HOLD_MS)),
+					{ activateApp: false },
+				);
+			default:
+				return performPointClick(appName, point, { activateApp: false });
+		}
+	}
+
+	private async performBatchType(params: GuiTypeParams, text: string): Promise<GuiNativeActionResult> {
+		if (
+			params.typeStrategy === "system_events_paste" ||
+			params.typeStrategy === "system_events_keystroke" ||
+			params.typeStrategy === "system_events_keystroke_chars"
+		) {
+			return performSystemEventsType(params, text, params.typeStrategy);
+		}
+		if (params.typeStrategy) {
+			return performNativeType(params, text);
+		}
+		try {
+			return await performType(params, text);
+		} catch (error) {
+			if (!(error instanceof GuiRuntimeError)) {
+				throw error;
+			}
+			return performNativeType(params, text);
+		}
+	}
+
+	private async executeBatchStep(params: {
+		step: GuiBatchStep;
+		index: number;
+		grounded: GroundedGuiTarget | undefined;
+		appName?: string;
+	}): Promise<Record<string, unknown>> {
+		const { step, index, grounded, appName } = params;
+		const base: Record<string, unknown> = { index, action: step.action, target: step.target };
+		try {
+			if (this.batchStepNeedsGrounding(step) && !grounded) {
+				return { ...base, status: "not_found", error: "No confident visual GUI target was found." };
+			}
+			switch (step.action) {
+				case "click":
+				case "right_click":
+				case "double_click":
+				case "hover": {
+					const point = grounded!.point;
+					const action = await this.performBatchPointAction(step, point, appName);
+					return {
+						...base,
+						status: "action_sent",
+						action_kind: action.actionKind,
+						executed_point: point,
+						confidence: grounded!.grounded.confidence,
+					};
+				}
+				case "scroll": {
+					const plan = resolveScrollPlan(
+						{
+							direction: step.direction,
+							distance: step.distance,
+							amount: step.amount,
+							target: step.target,
+						} as GuiScrollParams,
+						{ grounded: grounded ?? undefined },
+					);
+					const action = await performScroll(appName, grounded?.point, {
+						direction: step.direction,
+						plan,
+					}, { activateApp: !grounded });
+					return {
+						...base,
+						status: "action_sent",
+						action_kind: action.actionKind,
+						direction: step.direction ?? "down",
+						executed_point: grounded?.point,
+					};
+				}
+				case "type": {
+					const typeParams: GuiTypeParams = {
+						app: appName,
+						target: step.target,
+						value: step.value,
+						secretEnvVar: step.secretEnvVar,
+						secretCommandEnvVar: step.secretCommandEnvVar,
+						typeStrategy: step.typeStrategy,
+						replace: step.replace,
+						submit: step.submit,
+					};
+					const input = await resolveGuiTypeInput(typeParams);
+					if (grounded) {
+						await performPointClick(appName, grounded.point, { activateApp: true });
+						await new Promise((resolve) => setTimeout(resolve, DEFAULT_TYPE_FOCUS_SETTLE_MS));
+					}
+					const action = await this.performBatchType(typeParams, input.text);
+					return {
+						...base,
+						status: "action_sent",
+						action_kind: action.actionKind,
+						input_source: input.source,
+						executed_point: grounded?.point,
+					};
+				}
+				case "key": {
+					const key = step.key?.trim();
+					if (!key) {
+						return { ...base, status: "not_found", error: "key step requires a `key`." };
+					}
+					const repeat = Math.max(1, Math.min(50, Math.round(step.repeat ?? 1)));
+					const action = await performHotkey(
+						{ app: appName, key, modifiers: step.modifiers } as GuiKeyParams,
+						repeat,
+					);
+					return {
+						...base,
+						status: "action_sent",
+						action_kind: action.actionKind,
+						key: [...(step.modifiers ?? []), key].join("+"),
+						repeat,
+					};
+				}
+				case "move": {
+					if (typeof step.x !== "number" || typeof step.y !== "number") {
+						return { ...base, status: "not_found", error: "move step requires numeric x and y." };
+					}
+					const point = { x: Math.round(step.x), y: Math.round(step.y) };
+					await performHover(appName, point, 0, { activateApp: Boolean(appName) });
+					return { ...base, status: "action_sent", action_kind: "cg_move", executed_point: point };
+				}
+				default:
+					return { ...base, status: "not_found", error: `Unsupported batch action: ${String(step.action)}` };
+			}
+		} catch (error) {
+			if (error instanceof Error && error.name === "AbortError") {
+				throw error;
+			}
+			return { ...base, status: "error", error: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	/**
+	 * Execute up to {@link GUI_BATCH_MAX_STEPS} independent GUI steps against ONE
+	 * shared screenshot: all targeted steps are grounded in parallel against that
+	 * single capture, then executed sequentially, returning one combined result
+	 * and one final screenshot. Use only for steps with no visual dependency on
+	 * each other (a later step must not rely on an earlier step changing the UI).
+	 */
+	async batch(params: GuiBatchParams): Promise<GuiActionResult> {
+		if (!isGuiPlatformSupported()) {
+			return unsupportedResult(GUI_UNSUPPORTED_MESSAGE);
+		}
+		const appName = normalizeOptionalString(params.app);
+		const steps = Array.isArray(params.steps) ? params.steps : [];
+		if (steps.length === 0) {
+			return buildGuiResult({
+				text: "gui_batch requires at least one step.",
+				status: "unsupported",
+				summary: "Empty GUI batch.",
+				details: { error: "gui_batch requires at least one step.", batch: true, grounding_method: "grounding" },
+			});
+		}
+		if (steps.length > GUI_BATCH_MAX_STEPS) {
+			return buildGuiResult({
+				text: `gui_batch supports at most ${GUI_BATCH_MAX_STEPS} steps, received ${steps.length}.`,
+				status: "unsupported",
+				summary: "Too many GUI batch steps.",
+				details: {
+					error: `gui_batch supports at most ${GUI_BATCH_MAX_STEPS} steps.`,
+					batch: true,
+					grounding_method: "grounding",
+				},
+			});
+		}
+		const windowSelection = resolveWindowSelection({
+			windowTitle: params.windowTitle,
+			windowSelector: params.windowSelector,
+		});
+		const artifact = await captureScreenshotArtifact({
+			appName,
+			captureMode: params.captureMode,
+			windowSelector: windowSelection,
+		});
+		const stepResults: Array<Record<string, unknown>> = [];
+		let executedCount = 0;
+		try {
+			// Ground every targeted step against the single shared capture, in parallel.
+			const groundings = await Promise.all(
+				steps.map((step) => this.groundBatchStep(step, artifact, appName)),
+			);
+			// Execute steps sequentially using the pre-grounded points.
+			for (let index = 0; index < steps.length; index += 1) {
+				const result = await this.executeBatchStep({
+					step: steps[index],
+					index,
+					grounded: groundings[index],
+					appName,
+				});
+				if (result.status === "action_sent") {
+					executedCount += 1;
+				}
+				stepResults.push(result);
+			}
+		} finally {
+			await artifact.cleanup();
+		}
+		const evidence = await this.captureEvidenceImage({
+			appName,
+			captureMode: params.captureMode,
+			windowSelector: windowSelection,
+		});
+		const lines = stepResults.map((result) => {
+			const target = typeof result.target === "string" && result.target ? ` "${result.target}"` : "";
+			const error = typeof result.error === "string" && result.error ? ` (${result.error})` : "";
+			return `${(result.index as number) + 1}. ${String(result.action)}${target} → ${String(result.status)}${error}`;
+		});
+		return buildGuiResult({
+			text: [
+				`Executed ${executedCount}/${steps.length} GUI batch step(s) against one shared screenshot.`,
+				...lines,
+			].join("\n"),
+			status: executedCount > 0 ? "action_sent" : "not_found",
+			summary: "GUI batch executed.",
+			details: {
+				batch: true,
+				step_count: steps.length,
+				executed_count: executedCount,
+				steps: stepResults,
+				grounding_method: "grounding",
+				shared_capture: buildCaptureDetails(artifact.metadata),
+				...evidence.details,
+				app: appName,
+			},
+			image: evidence.image,
 		});
 	}
 }

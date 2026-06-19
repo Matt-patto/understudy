@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.3.0 — 2026-06-20
+
+Accelerate GUI automation and add Claude Code-style context management. GUI work now batches independent actions against a single screenshot and reuses a persistent native helper, and the agent keeps long conversations inside the model window with budgeting and compaction.
+
+### Added
+
+- **`gui_batch` tool** — execute up to 10 independent GUI steps against ONE shared screenshot: all targeted steps are grounded in parallel, then executed sequentially, returning one combined result and one final screenshot. Use for steps with no visual dependency on each other.
+- **Persistent serve-mode native GUI helper** — the macOS helper can run as a long-lived process speaking a newline-delimited JSON protocol, eliminating per-action process startup. Single-flight, auto-restart, and automatic fallback to one-shot on any error. Toggle with `UNDERSTUDY_GUI_HELPER_SERVE` (default on).
+- **Context management** — usage-aware token counting, a per-tool / per-message tool-result budget with on-disk overflow persistence (model sees a preview), microcompact (clears stale tool-result content without a model call), and autocompact (model-summarized history with a boundary marker and a 3-failure circuit breaker). Toggles: `UNDERSTUDY_CONTEXT_MICROCOMPACT`, `UNDERSTUDY_AUTOCOMPACT_DISABLED`, `UNDERSTUDY_AUTOCOMPACT_WINDOW`, `UNDERSTUDY_MAX_RESULT_SIZE_CHARS`.
+- **GUI emergency stop** (opt-in) — press Escape to abort in-flight GUI actions, wired into the abort flow. Enable with `UNDERSTUDY_GUI_EMERGENCY_STOP=1`.
+- **GUI physical-resource lock** (opt-in) — serializes GUI access across concurrent sessions with a lock file, stale detection, and backoff. Enable with `UNDERSTUDY_GUI_LOCK=1`.
+- **Self-window redaction** (opt-in) — grays the host terminal/IDE out of the model-facing screenshot only (grounding keeps pristine pixels). Enable with `UNDERSTUDY_GUI_REDACT_SELF=1`.
+
+### Changed
+
+- Model-facing GUI screenshots are now JPEG-encoded (quality 75) to cut token/payload cost, with PNG fallback; grounding still uses the lossless PNG. Toggle with `UNDERSTUDY_GUI_SCREENSHOT_JPEG` (default on).
+- Bumped all workspace package versions and Chrome extension metadata to `0.3.0`.
+
+### Notes
+
+- The emergency stop, physical-resource lock, and self-window redaction are macOS-native features that require a real desktop session to exercise; they ship opt-in so default behavior is unchanged until enabled.
+
 ## 0.2.0 — 2026-03-26
 
 Reposition Understudy around three ideas that now define the product more clearly in both code and docs: a general-purpose local agent first, modern computer use with bring-your-own API key second, and teach/crystallization/route-aware learning on top. This release also hardens the teach analysis path and aligns release/version metadata across the runtime.

@@ -5,7 +5,13 @@
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { type Model, type ThinkingLevel } from "@mariozechner/pi-ai";
+import {
+	type AssistantMessage,
+	type Message,
+	type Model,
+	type ThinkingLevel,
+	completeSimple,
+} from "@mariozechner/pi-ai";
 import type { AgentMessage, AgentTool } from "@mariozechner/pi-agent-core";
 import type { ToolEntry, UnderstudyConfig } from "@understudy/types";
 import { ConfigManager } from "../config.js";
@@ -53,6 +59,14 @@ import {
 	installToolResultContextGuard,
 	recoverContextAfterOverflowInPlace,
 } from "./tool-result-context-guard.js";
+import {
+	AUTOCOMPACT_SUMMARY_PROMPT,
+	MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES,
+	createAutocompactState,
+	resolveAutocompactContextWindow,
+	runAutocompact,
+	type SummarizeFn,
+} from "./autocompact.js";
 import {
 	RuntimePolicyPipeline,
 	wrapToolsWithPolicyPipeline,
@@ -174,6 +188,46 @@ export interface UnderstudySessionOptions {
 
 function mergeAgentMessage(target: AgentMessage, source: AgentMessage): AgentMessage {
 	return Object.assign(target, source);
+}
+
+/**
+ * Filter the agent context down to the LLM-compatible messages that can be sent
+ * to a one-off completion for autocompact summarization, then append the
+ * summarization request as a final user turn.
+ */
+function toSummarizableMessages(messages: AgentMessage[]): Message[] {
+	const llmMessages: Message[] = [];
+	for (const msg of messages) {
+		const role = (msg as { role?: unknown }).role;
+		if (role === "user" || role === "assistant" || role === "toolResult") {
+			llmMessages.push(msg as Message);
+		}
+	}
+	llmMessages.push({
+		role: "user",
+		content: "Summarize the conversation above following the instructions in the system prompt.",
+		timestamp: Date.now(),
+	});
+	return llmMessages;
+}
+
+/** Concatenate the text content blocks of an assistant message. */
+function extractAssistantText(message: AssistantMessage): string {
+	const content = (message as { content?: unknown }).content;
+	if (typeof content === "string") {
+		return content;
+	}
+	if (!Array.isArray(content)) {
+		return "";
+	}
+	return content
+		.map((block) =>
+			block && typeof block === "object" && (block as { type?: unknown }).type === "text"
+				? (block as { text?: unknown }).text
+				: undefined,
+		)
+		.filter((value): value is string => typeof value === "string")
+		.join("\n");
 }
 
 export interface UnderstudySessionResult extends RuntimeCreateSessionResult {
@@ -736,7 +790,33 @@ export async function createUnderstudySessionWithRuntime(
 	installToolResultContextGuard({
 		agent: session.agent as any,
 		contextWindowTokens,
+		// Persist oversized tool overflow under the runtime agent dir so the model
+		// can be pointed back to the full output via the inline preview path.
+		persistDir: agentDir,
 	});
+
+	// Autocompact: when the conversation approaches the model window, summarize
+	// the history before the next prompt dispatch. The model summary is produced
+	// via a one-off completeSimple call against the resolved model.
+	const autocompactState = createAutocompactState();
+	const autocompactMaxOutputTokens =
+		typeof model?.maxTokens === "number" && model.maxTokens > 0 ? model.maxTokens : 0;
+	const summarizeForAutocompact: SummarizeFn = async (messages) => {
+		if (!model) {
+			throw new Error("No resolved model available for autocompact summarization.");
+		}
+		const apiKey = await authContext.modelRegistry.getApiKey(model);
+		const llmMessages = toSummarizableMessages(messages);
+		const result = await completeSimple(
+			model,
+			{
+				systemPrompt: AUTOCOMPACT_SUMMARY_PROMPT,
+				messages: llmMessages,
+			},
+			apiKey ? { apiKey } : undefined,
+		);
+		return extractAssistantText(result);
+	};
 
 	// Runtime policy pipeline: prompt rewriting and reply hooks.
 	const originalPrompt = session.prompt.bind(session);
@@ -754,6 +834,34 @@ export async function createUnderstudySessionWithRuntime(
 			cwd,
 			model,
 		});
+
+		// Proactively autocompact before dispatch when we are near the window.
+		try {
+			const autocompactResult = await runAutocompact({
+				messages: session.agent.state.messages,
+				contextWindowTokens: resolveAutocompactContextWindow(contextWindowTokens),
+				maxOutputTokens: autocompactMaxOutputTokens,
+				state: autocompactState,
+				summarize: summarizeForAutocompact,
+			});
+			if (autocompactResult.compacted) {
+				(
+					session.agent as unknown as {
+						replaceMessages: (messages: AgentMessage[]) => void;
+					}
+				).replaceMessages(autocompactResult.messages);
+				logger.info(
+					`Autocompacted context (~${autocompactResult.estimatedTokens} tokens >= ${autocompactResult.threshold} threshold).`,
+				);
+			} else if (autocompactResult.reason === "summary-failed") {
+				logger.warn(
+					`Autocompact summary failed (consecutive failures: ${autocompactState.consecutiveFailures}/${MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES}).`,
+				);
+			}
+		} catch (error) {
+			logger.warn(`Autocompact pass failed unexpectedly: ${describeUnknownError(error)}`);
+		}
+
 		let recoveredOverflow = false;
 		for (let attempt = 1; attempt <= 3; attempt += 1) {
 			const messageCountBeforePrompt = session.agent.state.messages.length;

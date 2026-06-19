@@ -1,7 +1,10 @@
 import { Type, type Static, type TSchema } from "@sinclair/typebox";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import {
+	acquireGuiPhysicalLock,
 	ComputerUseGuiRuntime,
+	getEmergencyStopSignal,
+	guiPhysicalLockEnabled,
 	type GuiActionResult,
 	type GuiEnvironmentReadinessSnapshot,
 	type GuiGroundingProvider,
@@ -211,6 +214,77 @@ const GuiWaitSchema = Type.Object({
 	intervalMs: Type.Optional(Type.Number({ description: "Polling interval in milliseconds." })),
 });
 
+const GuiBatchStepSchema = Type.Object({
+	action: Type.Union([
+		Type.Literal("click"),
+		Type.Literal("right_click"),
+		Type.Literal("double_click"),
+		Type.Literal("hover"),
+		Type.Literal("scroll"),
+		Type.Literal("type"),
+		Type.Literal("key"),
+		Type.Literal("move"),
+	], { description: "The GUI action to perform for this step." }),
+	target: Type.Optional(Type.String({ description: `Semantic target for grounded actions (required for click variants; optional for scroll/type). ${GUI_TARGET_DESCRIPTION_SUFFIX}` })),
+	locationHint: Type.Optional(Type.String({ description: GUI_LOCATION_HINT_DESCRIPTION })),
+	scope: Type.Optional(Type.String({ description: GUI_SCOPE_DESCRIPTION })),
+	groundingMode: Type.Optional(Type.Union([
+		Type.Literal("single"),
+		Type.Literal("complex"),
+	], { description: GUI_GROUNDING_MODE_DESCRIPTION })),
+	button: Type.Optional(Type.Union([
+		Type.Literal("left"),
+		Type.Literal("right"),
+		Type.Literal("none"),
+	], { description: 'Mouse button for a click step. "right" = context menu, "none" = hover.' })),
+	clicks: Type.Optional(Type.Number({ description: "Number of clicks for a click step. Use 2 for double-click." })),
+	holdMs: Type.Optional(Type.Number({ description: "Press-and-hold duration in milliseconds for a click step." })),
+	settleMs: Type.Optional(Type.Number({ description: "Hover settle time in milliseconds for a hover step." })),
+	direction: Type.Optional(Type.Union([
+		Type.Literal("up"),
+		Type.Literal("down"),
+		Type.Literal("left"),
+		Type.Literal("right"),
+	], { description: "Scroll direction for a scroll step." })),
+	distance: Type.Optional(Type.Union([
+		Type.Literal("small"),
+		Type.Literal("medium"),
+		Type.Literal("page"),
+	], { description: "Scroll distance for a scroll step." })),
+	amount: Type.Optional(Type.Number({ description: "Advanced low-level scroll line override for a scroll step." })),
+	value: Type.Optional(Type.String({ description: "Literal text to type for a type step." })),
+	secretEnvVar: Type.Optional(Type.String({ description: "Env var whose value to type for a type step without exposing it in traces." })),
+	secretCommandEnvVar: Type.Optional(Type.String({ description: "Env var containing a command that prints the text to type for a type step." })),
+	typeStrategy: Type.Optional(Type.Union([
+		Type.Literal("physical_keys"),
+		Type.Literal("clipboard_paste"),
+		Type.Literal("system_events_paste"),
+		Type.Literal("system_events_keystroke"),
+		Type.Literal("system_events_keystroke_chars"),
+	], { description: "Text entry strategy for a type step." })),
+	replace: Type.Optional(Type.Boolean({ description: "Replace the existing field value before typing (type step). Default: true." })),
+	submit: Type.Optional(Type.Boolean({ description: "Press Return after typing (type step)." })),
+	key: Type.Optional(Type.String({ description: 'Key to press for a key step, e.g. "Enter", "Tab", "Escape", "s".' })),
+	modifiers: Type.Optional(Type.Array(Type.String({ description: 'Modifier names for a key step: "command", "shift", "option", "control".' }))),
+	repeat: Type.Optional(Type.Number({ description: "How many times to press the key for a key step. Default: 1." })),
+	x: Type.Optional(Type.Number({ description: "Absolute display X coordinate for a move step." })),
+	y: Type.Optional(Type.Number({ description: "Absolute display Y coordinate for a move step." })),
+});
+
+const GuiBatchSchema = Type.Object({
+	app: Type.Optional(Type.String({ description: "Optional macOS application name to act on. Defaults to the frontmost app." })),
+	captureMode: Type.Optional(Type.Union([
+		Type.Literal("window"),
+		Type.Literal("display"),
+	], { description: GUI_CAPTURE_MODE_DESCRIPTION })),
+	...GuiWindowSelectionFields,
+	steps: Type.Array(GuiBatchStepSchema, {
+		description:
+			"Up to 10 INDEPENDENT GUI steps executed against ONE shared screenshot. All targeted steps are grounded in parallel against that single capture, then executed in order. " +
+			"Use ONLY for steps with no visual dependency on each other — if a later step depends on an earlier step changing the screen, use separate gui_* calls instead.",
+	}),
+});
+
 type GuiObserveParams = Static<typeof GuiObserveSchema>;
 type GuiClickParams = Static<typeof GuiClickSchema>;
 type GuiDragParams = Static<typeof GuiDragSchema>;
@@ -219,6 +293,7 @@ type GuiTypeParams = Static<typeof GuiTypeSchema>;
 type GuiKeyParams = Static<typeof GuiKeySchema>;
 type GuiWaitParams = Static<typeof GuiWaitSchema>;
 type GuiMoveParams = Static<typeof GuiMoveSchema>;
+type GuiBatchParams = Static<typeof GuiBatchSchema>;
 
 function withGuiDetails(result: GuiActionResult): Record<string, unknown> {
 	return {
@@ -370,6 +445,7 @@ interface GuiToolRuntimeMap {
 	key: (params: GuiKeyParams, signal?: AbortSignal) => Promise<GuiActionResult>;
 	wait: (params: GuiWaitParams, signal?: AbortSignal) => Promise<GuiActionResult>;
 	move: (params: GuiMoveParams, signal?: AbortSignal) => Promise<GuiActionResult>;
+	batch: (params: GuiBatchParams, signal?: AbortSignal) => Promise<GuiActionResult>;
 }
 
 function buildGuiProgressResult(text: string, details: Record<string, unknown> = {}): AgentToolResult<unknown> {
@@ -566,16 +642,38 @@ function createGuiTool<TSchemaType extends TSchema>(
 			});
 			try {
 				throwIfGuiSignalAborted(signal);
-				const invokeRuntime = runner[options.method] as (
-					this: ComputerUseGuiRuntime & GuiToolRuntimeMap,
-					args: Static<TSchemaType>,
-					signal?: AbortSignal,
-				) => Promise<GuiActionResult>;
-				const runtimePromise = invokeRuntime.call(runner, params, signal);
-				const result = options.allowMidflightAbort
-					? await raceGuiRuntimeWithSignal(runtimePromise, signal)
-					: await runtimePromise;
-				return (options.toResult ?? toToolResult)(result);
+				// Serialize GUI access across sessions (opt-in) so two conversations
+				// never drive the shared screen/input at the same time. The enabled
+				// check is synchronous so the default path adds no scheduling gap.
+				const releaseLock = guiPhysicalLockEnabled()
+					? await acquireGuiPhysicalLock({ tool: options.name })
+					: undefined;
+				try {
+					const invokeRuntime = runner[options.method] as (
+						this: ComputerUseGuiRuntime & GuiToolRuntimeMap,
+						args: Static<TSchemaType>,
+						signal?: AbortSignal,
+					) => Promise<GuiActionResult>;
+					// Mid-flight-abortable tools also honor the user-driven emergency stop
+					// (press Escape) by combining it with the caller's signal. Side-effecting
+					// tools keep the original synchronous abort semantics above.
+					let effectiveSignal = signal;
+					if (options.allowMidflightAbort) {
+						const emergencySignal = await getEmergencyStopSignal();
+						if (emergencySignal) {
+							effectiveSignal = signal ? AbortSignal.any([signal, emergencySignal]) : emergencySignal;
+						}
+					}
+					const runtimePromise = invokeRuntime.call(runner, params, effectiveSignal);
+					const result = options.allowMidflightAbort
+						? await raceGuiRuntimeWithSignal(runtimePromise, effectiveSignal)
+						: await runtimePromise;
+					return (options.toResult ?? toToolResult)(result);
+				} finally {
+					if (releaseLock) {
+						await releaseLock();
+					}
+				}
 			} catch (error) {
 				if (error instanceof Error && error.name === "AbortError") {
 					throw error;
@@ -718,6 +816,23 @@ const GUI_TOOL_FACTORIES: GuiToolFactoryEntry[] = [
 		actionTarget: (params: GuiMoveParams) => `(${params.x}, ${params.y})`,
 		argsForHeartbeat: (params: GuiMoveParams) => ({ app: params.app }),
 	}),
+	defineGuiToolFactory({
+		name: "gui_batch",
+		label: "GUI Batch",
+		description:
+			"Run up to 10 INDEPENDENT GUI steps against a single shared screenshot to save time. " +
+			"All targeted steps are grounded in parallel against one capture, then executed in order, returning one combined result and one final screenshot. " +
+			"Use ONLY for steps with no visual dependency on each other — a later step must not rely on an earlier step changing the screen. " +
+			"For dependent sequences, use separate gui_* calls so each step re-observes the current state.",
+		parameters: GuiBatchSchema,
+		method: "batch",
+		progressLabel: "GUI batch",
+		errorLabel: "GUI batch",
+		actionTarget: (params: GuiBatchParams) => `${params.steps?.length ?? 0} step(s)`,
+		argsForHeartbeat: (params: GuiBatchParams) => ({ app: params.app }),
+		toResult: toScreenshotToolResult,
+		allowMidflightAbort: true,
+	}),
 ];
 
 export interface GuiToolCatalogEntry {
@@ -776,4 +891,8 @@ export function createGuiWaitTool(runtime: ComputerUseGuiRuntime = createDefault
 
 export function createGuiMoveTool(runtime: ComputerUseGuiRuntime = createDefaultGuiRuntime()): AgentTool<typeof GuiMoveSchema> {
 	return GUI_TOOL_FACTORIES.find((entry) => entry.name === "gui_move")!.create(runtime as ComputerUseGuiRuntime) as AgentTool<typeof GuiMoveSchema>;
+}
+
+export function createGuiBatchTool(runtime: ComputerUseGuiRuntime = createDefaultGuiRuntime()): AgentTool<typeof GuiBatchSchema> {
+	return GUI_TOOL_FACTORIES.find((entry) => entry.name === "gui_batch")!.create(runtime as ComputerUseGuiRuntime) as AgentTool<typeof GuiBatchSchema>;
 }

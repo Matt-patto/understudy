@@ -150,6 +150,67 @@ describe("installToolResultContextGuard", () => {
 		expect(latestText).toContain("assistant-17");
 	});
 
+	it("persists oversized tool results via an injected writer before char compaction", async () => {
+		const agent: any = {};
+		const writes: Array<{ id: string; chars: number }> = [];
+		installToolResultContextGuard({
+			agent,
+			contextWindowTokens: 200_000,
+			persistedToolResultWriter: (id, output) => {
+				writes.push({ id, chars: output.length });
+				return `mem://tool-results/${id}.json`;
+			},
+		});
+
+		const messages = [
+			{
+				role: "toolResult" as const,
+				toolCallId: "huge_call",
+				toolName: "bash",
+				content: [{ type: "text" as const, text: "Z".repeat(120_000) }],
+				details: {},
+				isError: false,
+				timestamp: Date.now(),
+			},
+		];
+		const transformed = await agent.transformContext(messages as any, new AbortController().signal);
+		const text = (transformed[0] as any).content[0].text as string;
+
+		expect(writes).toHaveLength(1);
+		expect(writes[0].id).toBe("huge_call");
+		expect(text).toContain("[persisted-output]");
+		expect(text).toContain("mem://tool-results/huge_call.json");
+	});
+
+	it("microcompacts older tool results in the transformContext path", async () => {
+		const agent: any = {};
+		installToolResultContextGuard({
+			agent,
+			contextWindowTokens: 1_000_000,
+			microcompact: { keepRecent: 2 },
+		});
+
+		const messages = Array.from({ length: 6 }, (_, i) => ({
+			role: "toolResult" as const,
+			toolCallId: `call_${i}`,
+			toolName: "bash",
+			content: [{ type: "text" as const, text: `result-${i}` }],
+			details: {},
+			isError: false,
+			timestamp: Date.now() + i,
+		}));
+
+		const transformed = await agent.transformContext(messages as any, new AbortController().signal);
+		const cleared = transformed.filter(
+			(m: any) => m.content[0]?.text === "[Old tool result content cleared]",
+		);
+		// 6 tool results, keepRecent 2 -> 4 cleared.
+		expect(cleared).toHaveLength(4);
+		// Most recent two keep their content.
+		expect(transformed[4].content[0].text).toBe("result-4");
+		expect(transformed[5].content[0].text).toBe("result-5");
+	});
+
 	it("restores original transformContext on uninstall", async () => {
 		const original = async (messages: any[]) => messages.slice(1);
 		const agent: any = {

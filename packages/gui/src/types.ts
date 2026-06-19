@@ -241,6 +241,56 @@ export interface GuiMoveParams {
 	app?: string;
 }
 
+export type GuiBatchAction =
+	| "click"
+	| "right_click"
+	| "double_click"
+	| "hover"
+	| "scroll"
+	| "type"
+	| "key"
+	| "move";
+
+export interface GuiBatchStep {
+	action: GuiBatchAction;
+	/** Semantic target for grounded actions (click variants, optional for scroll/type). */
+	target?: string;
+	locationHint?: string;
+	scope?: string;
+	groundingMode?: GuiGroundingMode;
+	/** click variants */
+	button?: "left" | "right" | "none";
+	clicks?: number;
+	holdMs?: number;
+	settleMs?: number;
+	/** scroll */
+	direction?: "up" | "down" | "left" | "right";
+	distance?: GuiScrollDistance;
+	amount?: number;
+	/** type */
+	value?: string;
+	secretEnvVar?: string;
+	secretCommandEnvVar?: string;
+	typeStrategy?: GuiTypeParams["typeStrategy"];
+	replace?: boolean;
+	submit?: boolean;
+	/** key */
+	key?: string;
+	modifiers?: string[];
+	repeat?: number;
+	/** move */
+	x?: number;
+	y?: number;
+}
+
+export interface GuiBatchParams {
+	app?: string;
+	captureMode?: GuiCaptureMode;
+	windowTitle?: string;
+	windowSelector?: GuiWindowSelector;
+	steps: GuiBatchStep[];
+}
+
 export interface GuiActionResult {
 	text: string;
 	observation?: GuiObservation;
